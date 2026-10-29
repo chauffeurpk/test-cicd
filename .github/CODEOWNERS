@@ -1,0 +1,3 @@
+# Pipeline files need a release-team review before they merge.
+# Replace YOUR-ORG with the sandbox organization's name.
+/.github/ @chauffeurpk/release

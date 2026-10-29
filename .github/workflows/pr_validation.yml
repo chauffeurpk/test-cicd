@@ -1,0 +1,1061 @@
+# =====================================================================
+# SANDBOX COPY - generated from workflows/phase2.yaml. Do not edit by hand.
+# Jira, Confluence, Heroku and Cloudflare are SIMULATED (see sandbox/README.md).
+# NEVER install this file in a real repo: it reports fake deploys as healthy.
+# =====================================================================
+name: PR Validation
+
+on:
+  pull_request:
+    # opened / reopened / synchronize / edited / ready_for_review keep the
+    # required "PR validation" check current for every commit.
+    # review_requested and labeled are the release signals:
+    #   non-PCI - a release-team member requests review from the release team
+    #   PCI     - a release-team member adds the pci-approved label
+    types: [opened, reopened, synchronize, edited, ready_for_review, review_requested, labeled]
+    branches:
+      - UAT
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 1. VALIDATION - make this the required status check on UAT.
+  #
+  # Runs on every PR event, never waits on the queue and never merges, so it
+  # always finishes. Deliberately has NO job-level `if`: a skipped job reports
+  # success, so a skipped run could overwrite a failed check on the same commit.
+  # ---------------------------------------------------------------------
+  validate:
+    name: PR validation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    outputs:
+      jira_ticket: ${{ steps.jira.outputs.jira_ticket }}
+      is_pci: ${{ steps.pci-classify.outputs.is_pci }}
+    steps:
+      # A PCI approval is for the commit release looked at. Housekeeping only -
+      # the release job separately pins the approved commit's SHA, so a stale
+      # label could never release new commits anyway.
+      - name: Withdraw PCI approval after the PR changes
+        if: github.event.action == 'synchronize' || (github.event.action == 'edited' && (github.event.changes.title || github.event.changes.base))
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                name: 'pci-approved'
+              });
+              core.info('pci-approved removed - it applied to an earlier version of this PR.');
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+
+      - name: Check for merge conflicts
+        id: conflict-check
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const number = context.issue.number;
+
+            let pr;
+            for (let attempt = 0; attempt < 6; attempt++) {
+              const response = await github.rest.pulls.get({ owner, repo, pull_number: number });
+              pr = response.data;
+              if (pr.mergeable !== null) break;
+              core.info('GitHub is still computing mergeability, retrying...');
+              await new Promise(resolve => setTimeout(resolve, 5000));
+            }
+
+            if (pr.mergeable === null) {
+              core.setOutput('conflicted', 'unknown');
+              core.warning('GitHub could not determine mergeability in time; the release merge will still be refused if the PR actually conflicts.');
+              return;
+            }
+
+            if (pr.mergeable === false || pr.mergeable_state === 'dirty') {
+              core.setOutput('conflicted', 'true');
+              core.setFailed(`Merge conflicts with ${pr.base.ref} (mergeable_state: ${pr.mergeable_state}). Resolve them and push.`);
+              return;
+            }
+
+            core.setOutput('conflicted', 'false');
+            core.info(`Mergeable state: ${pr.mergeable_state}`);
+
+      # The remaining steps run even if an earlier one failed, so the comment
+      # always reports every check, not just the first failure.
+      - name: Detect PCI Files
+        if: ${{ !cancelled() }}
+        id: detect-pci-files
+        uses: actions/github-script@v7
+        env:
+          # PCI paths:
+          #   path/** = recursive (path and all nested folders)
+          #   path/*  = only direct files in path, not subfolders
+          #   ./*     = root directory files only
+          # .github/** is recursive on purpose: pull_request runs the workflow
+          # file from the PR itself, so a PR that edits workflows or scripts
+          # could otherwise switch off its own checks. Those always need a human.
+          PCI_PATHS: "./* .github/** config/** src/payments/**"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pciPatterns = process.env.PCI_PATHS.split(' ').filter(Boolean);
+
+            // Get changed files from GitHub API - paginate to handle 100+ files
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              per_page: 100
+            });
+
+            // A rename touches both paths - moving a file OUT of a PCI path is a PCI change too.
+            const changedFiles = files.flatMap(f => f.previous_filename ? [f.filename, f.previous_filename] : [f.filename]);
+            core.info('Changed files: ' + changedFiles.join(', '));
+
+            let pciDetected = false;
+            const matched = [];
+
+            for (const file of changedFiles) {
+              for (const pattern of pciPatterns) {
+                let isPCI = false;
+
+                if (pattern === './*') {
+                  // Root directory files only - no slashes in path
+                  isPCI = !file.includes('/');
+                } else if (pattern.endsWith('/**')) {
+                  // Recursive: match path and all nested
+                  const basePath = pattern.slice(0, -3);
+                  isPCI = file === basePath || file.startsWith(basePath + '/');
+                } else if (pattern.endsWith('/*')) {
+                  // Only direct files, not subfolders
+                  const basePath = pattern.slice(0, -2);
+                  if (file.startsWith(basePath + '/')) {
+                    const remainder = file.slice(basePath.length + 1);
+                    isPCI = !remainder.includes('/'); // No further slashes = direct file
+                  }
+                } else {
+                  // Exact match
+                  isPCI = file === pattern;
+                }
+
+                if (isPCI) {
+                  pciDetected = true;
+                  matched.push(file);
+                  core.info(`PCI file: ${file} (matches: ${pattern})`);
+                  break;
+                }
+              }
+            }
+
+            core.setOutput('pci_detected', pciDetected);
+            core.setOutput('matched_files', matched.join('\n'));
+            core.info(`PCI detected: ${pciDetected}`);
+
+      - name: Extract Jira Ticket
+        if: ${{ !cancelled() }}
+        id: jira
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BRANCH_NAME: ${{ github.head_ref }}
+        run: |
+          echo "PR Title: $PR_TITLE"
+          echo "Branch Name: $BRANCH_NAME"
+          JIRA_TICKET=$(echo "$PR_TITLE $BRANCH_NAME" | grep -oE '[A-Z]+-[0-9]+' | head -1)
+          echo "jira_ticket=$JIRA_TICKET" >> $GITHUB_OUTPUT
+
+          if [ -z "$JIRA_TICKET" ]; then
+            echo "::error::No Jira Ticket found in PR title or branch name"
+            exit 1
+          fi
+
+          echo "Found Jira Ticket: $JIRA_TICKET"
+
+      - name: Validate Jira Ticket
+        if: ${{ !cancelled() && steps.jira.outputs.jira_ticket != '' }}
+        id: jira-validate
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          JIRA_TICKET="${{ steps.jira.outputs.jira_ticket }}"
+          echo "DEBUG: Jira Ticket from previous step: '$JIRA_TICKET'"
+
+          if [ -z "$JIRA_TICKET" ]; then
+            echo "::error::Jira Ticket is empty - output from previous step not received"
+            exit 1
+          fi
+
+          # SANDBOX: Jira is simulated by the repo variable SIM_JIRA_<KEY>,
+          # e.g. SIM_JIRA_DEV_1 = "Ready For Production|No" (status|PCI field).
+          SIM=$(gh api "repos/${GITHUB_REPOSITORY}/actions/variables/SIM_JIRA_${JIRA_TICKET//-/_}" --jq '.value' 2>/dev/null) || SIM=""
+          if [ -n "$SIM" ]; then
+            ISSUE=$(jq -n --arg s "${SIM%%|*}" --arg p "${SIM#*|}" '{fields: {status: {name: $s}, customfield_10733: {value: $p}}}')
+          else
+            ISSUE='{"errorMessages": ["Issue does not exist (no SIM_JIRA variable for this key)"]}'
+          fi
+
+          # Check if curl failed or response is empty
+          if [ $? -ne 0 ] || [ -z "$ISSUE" ]; then
+            echo "::error::Failed to fetch Jira ticket - API request failed"
+            echo "passed=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          # Check for Jira API error response
+          ERROR_MSG=$(echo "$ISSUE" | jq -r '.errorMessages[0]')
+          if [ -n "$ERROR_MSG" ] && [ "$ERROR_MSG" != "null" ]; then
+            echo "::error::Jira API error: $ERROR_MSG"
+            echo "passed=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          STATUS=$(echo "$ISSUE" | jq -r '.fields.status.name')
+          PCI_TAG=$(echo "$ISSUE" | jq -r '.fields.customfield_10733.value // "no"')
+
+          # Check if we got valid data
+          if [ -z "$STATUS" ] || [ "$STATUS" == "null" ]; then
+            echo "::error::Failed to parse Jira response - status field not found"
+            echo "passed=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          echo "Jira Status: $STATUS"
+          echo "Jira PCI Tag: $PCI_TAG"
+          # Output status and PCI for the comment
+          echo "jira_status=$STATUS" >> $GITHUB_OUTPUT
+          echo "jira_pci=$PCI_TAG" >> $GITHUB_OUTPUT
+
+          # Check status
+          # TESTING ONLY: "Open" is accepted so test tickets pass. Remove before go-live.
+          if [ "$STATUS" != "Ready For Production" ] && [ "$STATUS" != "Open" ]; then
+            echo "::error::Jira ticket must be in 'Ready For Production' or 'Open' status (current: $STATUS)"
+            echo "passed=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          # PCI (Jira field or file paths) is a routing decision, not a
+          # validation failure - "Classify deployment scope" below combines
+          # this with file-based detection.
+          if [ "$PCI_TAG" == "Yes" ] || [ "$PCI_TAG" == "yes" ]; then
+            echo "Jira ticket is marked as PCI - release needs the pci-approved label"
+          fi
+
+          echo "Jira validation passed"
+          echo "passed=true" >> $GITHUB_OUTPUT
+
+      - name: Classify deployment scope
+        if: ${{ !cancelled() && steps.detect-pci-files.outcome == 'success' }}
+        id: pci-classify
+        uses: actions/github-script@v7
+        env:
+          JIRA_PCI: ${{ steps.jira-validate.outputs.jira_pci }}
+          PCI_DETECTED: ${{ steps.detect-pci-files.outputs.pci_detected }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const jiraPci = /^(yes|true|pci)$/i.test(process.env.JIRA_PCI || '');
+            const filesPci = process.env.PCI_DETECTED === 'true';
+            const isPci = jiraPci || filesPci;
+            const add = isPci ? 'deployment:pci' : 'deployment:non-pci';
+            const remove = isPci ? 'deployment:non-pci' : 'deployment:pci';
+
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                name: remove
+              });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: [add]
+            });
+            core.setOutput('is_pci', isPci);
+            core.info(`Deployment classified as ${isPci ? 'PCI' : 'non-PCI'}`);
+
+      # One comment per PR, updated in place on every run instead of a new
+      # comment for every push or label.
+      - name: Post Validation Result
+        if: ${{ !cancelled() }}
+        uses: actions/github-script@v7
+        env:
+          JIRA_TICKET: ${{ steps.jira.outputs.jira_ticket }}
+          JIRA_BASE_URL: https://jira.example.invalid
+          PASSED: ${{ steps.jira-validate.outputs.passed }}
+          JIRA_STATUS: ${{ steps.jira-validate.outputs.jira_status }}
+          JIRA_PCI: ${{ steps.jira-validate.outputs.jira_pci }}
+          IS_PCI: ${{ steps.pci-classify.outputs.is_pci }}
+          PCI_DETECTED: ${{ steps.detect-pci-files.outputs.pci_detected }}
+          MATCHED_FILES: ${{ steps.detect-pci-files.outputs.matched_files }}
+          CONFLICTED: ${{ steps.conflict-check.outputs.conflicted }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const {
+              JIRA_TICKET, JIRA_BASE_URL, PASSED, JIRA_STATUS, JIRA_PCI, IS_PCI,
+              PCI_DETECTED, MATCHED_FILES, CONFLICTED,
+            } = process.env;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issue_number = context.issue.number;
+
+            const passed = PASSED === 'true' && CONFLICTED !== 'true';
+            const jira = JIRA_TICKET
+              ? `[${JIRA_TICKET}](${JIRA_BASE_URL}/browse/${JIRA_TICKET})`
+              : 'No Jira ticket found in the PR title or branch name';
+            const conflicts = CONFLICTED === 'true' ? 'Yes' : CONFLICTED === 'false' ? 'None' : 'Unknown';
+            const scope = IS_PCI === 'true' ? 'PCI' : 'Non-PCI';
+            const pciFiles = PCI_DETECTED === 'true' ? 'Yes' : 'No';
+            const pciSection = PCI_DETECTED === 'true'
+              ? `\n\n**PCI files detected:**\n\`\`\`\n${MATCHED_FILES?.trim() || ''}\n\`\`\``
+              : '';
+
+            const nextStep = !passed
+              ? 'Fix the failing checks and push - validation re-runs on every update.'
+              : IS_PCI === 'true'
+                ? '**PCI change.** To release this exact commit, a release-team member adds the `pci-approved` label. Any new commit removes the label, and it must be added again.'
+                : 'To release, a release-team member requests review from the release team. App Locks and the previous UAT deploy are checked when the PR reaches the front of the queue.';
+
+            const marker = '<!-- pr-validation -->';
+            const body = `${marker}\n## PR validation: ${passed ? 'Passed' : 'Failed'}\n\n**Jira:** ${jira}\n\n| Check | Result | Required |\n|-------|--------|----------|\n| Jira status | ${JIRA_STATUS || 'Unknown'} | Ready For Production |\n| Merge conflicts | ${conflicts} | None |\n| Jira PCI | ${JIRA_PCI || 'Unknown'} | - |\n| PCI files | ${pciFiles} | - |\n| Deployment scope | ${scope} | - |${pciSection}\n\n${nextStep}\n\n---\n_Commit ${context.payload.pull_request.head.sha.slice(0, 7)}, checked at ${new Date().toUTCString()}_`;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100
+            });
+            const existing = comments.find(c => c.user?.type === 'Bot' && c.body?.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+  # ---------------------------------------------------------------------
+  # 2. RELEASE - the only thing that merges to UAT.
+  #
+  # Starts after validation passes in this same run, then waits for the
+  # branch-UAT slot and holds it from the final gates through a verified
+  # deployment:
+  #   gates -> mark in progress -> merge the approved commit -> watch Heroku
+  #   -> purge cache -> clear the flag -> release the slot
+  # queue: max lets up to 100 runs wait FIFO by when each started waiting;
+  # without it only one may be pending and the rest are cancelled.
+  # cancel-in-progress must stay false - GitHub rejects it with queue: max.
+  #
+  # Do NOT make this job a required check: it finishes only after merging.
+  # ---------------------------------------------------------------------
+  release:
+    name: Release to UAT
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: write
+    if: |
+      (github.event.action == 'review_requested' && github.event.requested_team.name == 'release' && needs.validate.outputs.is_pci != 'true') ||
+      (github.event.action == 'labeled' && github.event.label.name == 'pci-approved')
+    concurrency:
+      group: branch-UAT
+      cancel-in-progress: false
+      queue: max
+    env:
+      # Update these per repo. RELEASE_TEAM case does not matter - it is
+      # lowercased into a team slug for the membership API.
+      PIPELINE_NAME: "sandbox-app"
+      RELEASE_TEAM: Release
+    steps:
+      # Anyone with write access can request a team review or add a label, so
+      # the person who did it must be on the release team. Fails closed.
+      - name: Authorise release request
+        id: authorize
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const sender = context.payload.sender.login;
+            const slug = String(process.env.RELEASE_TEAM).toLowerCase().replace(/\s+/g, '-');
+
+            let active = false;
+            try {
+              const r = await github.request(
+                'GET /orgs/{org}/teams/{team_slug}/memberships/{username}',
+                { org: owner, team_slug: slug, username: sender });
+              active = r.data.state === 'active';
+            } catch (error) {
+              if (error.status !== 404) {
+                core.setFailed(`Could not verify @${sender} in @${owner}/${slug}: ${error.message}. Not releasing.`);
+                return;
+              }
+            }
+
+            if (!active) {
+              core.setFailed(`Release was requested by @${sender}, who is not an active member of @${owner}/${slug}. Only the release team can release to UAT.`);
+              return;
+            }
+
+            const how = context.payload.action === 'labeled' ? 'added pci-approved' : 'requested release';
+            core.info(`@${sender} ${how} for commit ${context.payload.pull_request.head.sha.slice(0, 7)}.`);
+
+      # The run may have waited in the queue a long time. The release request
+      # was for the PR exactly as it stood then; if it changed since, stand down.
+      - name: Check PR is still current
+        id: current
+        uses: actions/github-script@v7
+        env:
+          IS_PCI: ${{ needs.validate.outputs.is_pci }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const requested = context.payload.pull_request;
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: requested.number
+            });
+
+            const changed = [];
+            if (pr.state !== 'open') changed.push(`the PR is now ${pr.merged ? 'merged' : pr.state}`);
+            if (pr.head.sha !== requested.head.sha) changed.push(`new commits were pushed (${requested.head.sha.slice(0, 7)} -> ${pr.head.sha.slice(0, 7)})`);
+            if (pr.base.ref !== requested.base.ref) changed.push(`the base branch changed (${requested.base.ref} -> ${pr.base.ref})`);
+            if (pr.title !== requested.title) changed.push('the title changed, which can change the Jira ticket');
+            if (process.env.IS_PCI === 'true' && !pr.labels.some(l => l.name === 'pci-approved')) changed.push('the pci-approved label was removed');
+
+            if (changed.length > 0) {
+              core.setFailed(`Superseded: ${changed.join('; ')}. Nothing was merged.`);
+            } else {
+              core.info(`PR is unchanged since release was requested (${pr.head.sha.slice(0, 7)}).`);
+            }
+
+      # Two ways to skip the App Locks:
+      #   bug-fix      - an FTE-approved bug fix
+      #   bypass-lock  - a release-team override
+      #
+      # Both are authorised against the RELEASE team for now - there is no FTE
+      # team in the org yet. When there is one, add an FTE_TEAM env value and
+      # point bug-fix at it in the RULES map below; nothing else changes.
+      #
+      # The label alone is not enough. Anyone with write access can add a
+      # label, so this checks WHO added it, from the PR timeline, against
+      # GitHub org team membership. A label applied by someone outside the
+      # authorised team is reported and ignored.
+      #
+      # Fails closed: if membership cannot be verified at all (token missing
+      # read:org, API error), the bypass is NOT honoured. Jira, PCI and the
+      # deploy-health breaker are never bypassed by either label.
+      - name: Check lock bypass label
+        id: bypass
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const number = context.issue.number;
+
+            // label -> the team allowed to apply it. Both point at the
+            // release team until an FTE team exists in the org.
+            const RULES = {
+              'bug-fix': process.env.RELEASE_TEAM,
+              'bypass-lock': process.env.RELEASE_TEAM,
+            };
+
+            // Live labels, not the event's - this run may have waited in the queue.
+            const { data: live } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+            const labels = live.labels.map(l => l.name);
+            const present = Object.keys(RULES).filter(l => labels.includes(l));
+
+            if (present.length === 0) {
+              core.setOutput('bypass', 'false');
+              core.info('No bypass label present - App Lock checks apply.');
+              return;
+            }
+
+            const events = await github.paginate(github.rest.issues.listEventsForTimeline, {
+              owner, repo, issue_number: number, per_page: 100
+            });
+
+            async function inTeam(login, team) {
+              try {
+                // GitHub team slugs are lowercase-hyphenated; the display
+                // name may be capitalised. Normalise so either form works.
+                const slug = String(team).toLowerCase().replace(/\s+/g, '-');
+                const r = await github.request(
+                  'GET /orgs/{org}/teams/{team_slug}/memberships/{username}',
+                  { org: owner, team_slug: slug, username: login });
+                return r.data.state === 'active';
+              } catch (error) {
+                if (error.status === 404) return false;
+                // 401/403 = the token cannot read org teams. Fail closed.
+                core.warning(`Could not verify ${login} in @${owner}/${team}: ${error.message}`);
+                return false;
+              }
+            }
+
+            const granted = [];
+            const refused = [];
+
+            for (const label of present) {
+              const team = RULES[label];
+              // most recent application wins - a label can be removed and re-added
+              const applied = events.filter(
+                e => e.event === 'labeled' && e.label && e.label.name === label);
+
+              if (applied.length === 0) {
+                refused.push(`\`${label}\` - could not determine who applied it`);
+                continue;
+              }
+
+              const actor = applied[applied.length - 1].actor && applied[applied.length - 1].actor.login;
+              if (!actor) {
+                refused.push(`\`${label}\` - no actor recorded on the label event`);
+                continue;
+              }
+
+              if (await inTeam(actor, team)) {
+                granted.push(`\`${label}\` by @${actor} (@${owner}/${team})`);
+              } else {
+                refused.push(`\`${label}\` applied by @${actor}, who is not an active member of @${owner}/${team}`);
+              }
+            }
+
+            if (refused.length > 0) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: number,
+                body: `## Bypass label not honoured\n\n${refused.map(r => `- ${r}`).join('\n')}\n\nThe App Lock still applies. Bypass labels may only be applied by @${owner}/${process.env.RELEASE_TEAM}.`
+              });
+              for (const r of refused) core.warning(r.replace(/`/g, ''));
+            }
+
+            if (granted.length > 0) {
+              core.setOutput('bypass', 'true');
+              core.warning(`App Lock checks skipped: ${granted.join('; ').replace(/`/g, '')}. Jira and PCI checks still apply.`);
+            } else {
+              core.setOutput('bypass', 'false');
+            }
+
+      # Locks are checked once. A locked app fails the release straight away
+      # (no polling, so no runner minutes spent waiting) and the PR drops out
+      # of the queue with a comment; release re-requests it after unlocking.
+      - name: Check App Lock (Confluence)
+        id: app-lock
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -uo pipefail
+
+          if [[ "${{ steps.bypass.outputs.bypass }}" == "true" ]]; then
+            echo "Authorised bypass label present - skipping App Lock check"
+            echo "frozen=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # SANDBOX: the App Lock page is simulated. SIM_CONFLUENCE_STATUS is the
+          # status in this pipeline's row (OPEN, FROZEN, blank...); the real
+          # parser below then reads it exactly as it reads the Confluence page.
+          SIM_STATUS=$(gh api "repos/${GITHUB_REPOSITORY}/actions/variables/SIM_CONFLUENCE_STATUS" --jq '.value' 2>/dev/null) || SIM_STATUS=""
+          RESPONSE=$(jq -n --arg p "$PIPELINE_NAME" --arg s "$SIM_STATUS" '
+            def cell(t): {type: "tableCell", content: [{type: "paragraph", content: [{type: "text", text: t}]}]};
+            {body: {atlas_doc_format: {value: ({type: "doc", content: [{type: "table", content: [{type: "tableRow", content: [
+              cell("Sandbox"), cell($p),
+              {type: "tableCell", content: [{type: "paragraph", content: (if $s == "" then [] else [{type: "status", attrs: {text: $s, color: "neutral"}}] end)}]}
+            ]}]}]} | tojson)}}}')
+
+          RESULT=""
+          if [ -n "$RESPONSE" ]; then
+            # Tables are nested inside layoutSections, so search recursively.
+            # The status is in a "status" element's attrs, not the cell text.
+            RESULT=$(echo "$RESPONSE" | jq -r --arg pipeline "$PIPELINE_NAME" '
+              .body.atlas_doc_format.value | fromjson |
+              [.. | select(.type? == "table") |
+              .content[]? | select(.type == "tableRow") |
+              [.content[]? | select(.type == "tableCell" or .type == "tableHeader") | {
+                text: ([.. | select(.type? == "text") | .text] | join("")),
+                status: ([.. | select(.type? == "status") | .attrs.text] | first // ""),
+                status_color: ([.. | select(.type? == "status") | .attrs.color] | first // ""),
+                links: ([.. | select(.type? == "inlineCard") | .attrs.url] | first // "")
+              }] |
+              select(.[1].text == $pipeline) |
+              {
+                brand: .[0].text,
+                pipeline: .[1].text,
+                status: .[2].status,
+                status_color: .[2].status_color,
+                ticket_url: .[2].links
+              }] | first
+            ' 2>/dev/null) || RESULT=""
+          fi
+
+          FROZEN="true"; BRAND=""; TICKET=""; STATUS=""; REASON=""
+
+          if [ -z "$RESPONSE" ]; then
+            REASON="Failed to fetch the Confluence page"
+          elif [ -z "$RESULT" ] || [ "$RESULT" = "null" ]; then
+            REASON="Pipeline '$PIPELINE_NAME' was not found in the App Lock table"
+          else
+            STATUS=$(echo "$RESULT" | jq -r '.status // ""')
+            STATUS_COLOR=$(echo "$RESULT" | jq -r '.status_color // ""')
+            TICKET_URL=$(echo "$RESULT" | jq -r '.ticket_url // ""')
+            BRAND=$(echo "$RESULT" | jq -r '.brand // ""')
+            if [ -n "$TICKET_URL" ]; then
+              # || true: a link with no Jira key in it (a Slack thread, a
+              # Confluence page) must not crash the step. Under pipefail an
+              # empty grep fails the pipeline, and set -e would then kill the
+              # whole App Lock check instead of reporting open or frozen.
+              TICKET=$(echo "$TICKET_URL" | grep -oE '[A-Z]+-[0-9]+' | head -1 || true)
+            fi
+
+            # Only an explicit OPEN allows deployments. Blank, unknown or anything
+            # else ("Unlocked", "Frozen", a typo) blocks - fail closed.
+            if ! echo "$STATUS" | grep -qiE '^[[:space:]]*open[[:space:]]*$'; then
+              REASON="Status is '${STATUS:-blank}' - only OPEN allows deployments"
+            elif [ "$STATUS_COLOR" = "red" ]; then
+              REASON="Status colour is red"
+            else
+              FROZEN="false"
+            fi
+          fi
+
+          echo "brand=$BRAND" >> $GITHUB_OUTPUT
+          echo "frozen=$FROZEN" >> $GITHUB_OUTPUT
+
+          if [ "$FROZEN" = "false" ]; then
+            echo "App Lock is open for $PIPELINE_NAME (status: $STATUS)"
+            exit 0
+          fi
+
+          echo "freeze_ticket=$TICKET" >> $GITHUB_OUTPUT
+          echo "::error::App Lock is not open for $PIPELINE_NAME. ${REASON}. Ticket: ${TICKET:-none}"
+          exit 1
+
+      # Toggled via repo Settings -> Variables (or `gh variable set`), never a commit,
+      # so locking/unlocking never pushes to UAT/main and can't trigger a Heroku auto-deploy.
+      # Read live via the API, not the vars context, which is fixed at job start.
+      - name: Check App Lock (Repo Variable)
+        id: app-lock-repo
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -uo pipefail
+
+          # Reads a repository variable live. A variable that does not exist yet
+          # (HTTP 404) reads as empty; any other failure - typically a token
+          # without Variables read access - fails the step instead of silently
+          # treating the gate as open.
+          read_var() {
+            local out
+            if out=$(gh api "repos/${GITHUB_REPOSITORY}/actions/variables/$1" --jq '.value' 2>&1); then
+              printf '%s' "$out"; return 0
+            fi
+            if printf '%s' "$out" | grep -q 'HTTP 404'; then
+              return 0
+            fi
+            echo "::error::Could not read repository variable $1 - failing closed: $out" >&2
+            return 1
+          }
+
+          if [[ "${{ steps.bypass.outputs.bypass }}" == "true" ]]; then
+            echo "Authorised bypass label present - skipping repo-variable App Lock check"
+            exit 0
+          fi
+
+          # `|| exit 1`: there is no set -e here, so without it a failed read
+          # would leave the value empty and the lock would read as open.
+          APP_LOCKED=$(read_var APP_LOCKED) || exit 1
+          if [[ "$APP_LOCKED" == "true" ]]; then
+            APP_LOCKED_BY=$(read_var APP_LOCKED_BY) || true
+            APP_LOCKED_REASON=$(read_var APP_LOCKED_REASON) || true
+            echo "::error::APP_LOCKED is set for $PIPELINE_NAME by ${APP_LOCKED_BY:-unknown}: ${APP_LOCKED_REASON:-no reason given}"
+            exit 1
+          fi
+          echo "Repo variable App Lock check passed - $PIPELINE_NAME is open for deployments"
+
+      # Set while a release is in flight and after a deploy that never came up
+      # healthy (see "Mark release in progress" below). Deliberately NOT
+      # skippable by the bypass labels - a crashing app doesn't resolve
+      # by waiting, and stacking another unverified merge on top of a live
+      # incident only compounds it. Release team must confirm the app is
+      # actually healthy (or has fixed it) and clear this themselves:
+      #   gh variable set UAT_DEPLOY_FAILED --body false
+      - name: Check UAT deploy health
+        id: deploy-health
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          # Reads a repository variable live. A variable that does not exist yet
+          # (HTTP 404) reads as empty; any other failure - typically a token
+          # without Variables read access - fails the step instead of silently
+          # treating the gate as open.
+          read_var() {
+            local out
+            if out=$(gh api "repos/${GITHUB_REPOSITORY}/actions/variables/$1" --jq '.value' 2>&1); then
+              printf '%s' "$out"; return 0
+            fi
+            if printf '%s' "$out" | grep -q 'HTTP 404'; then
+              return 0
+            fi
+            echo "::error::Could not read repository variable $1 - failing closed: $out" >&2
+            return 1
+          }
+
+          # Read live, not from the vars context: this run may have waited in
+          # the queue while the release ahead of it deployed badly.
+          # `|| exit 1`: a failed read must not leave the flag empty and read as healthy.
+          UAT_DEPLOY_FAILED=$(read_var UAT_DEPLOY_FAILED) || exit 1
+          UAT_DEPLOY_FAILED_REASON=$(read_var UAT_DEPLOY_FAILED_REASON) || true
+          UAT_DEPLOY_FAILED_RUN_URL=$(read_var UAT_DEPLOY_FAILED_RUN_URL) || true
+          if [ "$UAT_DEPLOY_FAILED" == "true" ]; then
+            echo "::error::The last UAT release was not verified healthy: ${UAT_DEPLOY_FAILED_REASON:-no reason recorded}. See: ${UAT_DEPLOY_FAILED_RUN_URL:-no run recorded}. Release team must confirm the app is healthy and run 'gh variable set UAT_DEPLOY_FAILED --body false' before more PRs can release."
+            echo "frozen=true" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          echo "frozen=false" >> $GITHUB_OUTPUT
+
+      # Master on/off switch, the last gate before anything changes. With it
+      # unset or false you get a full dry run - every gate exercised against
+      # the real Confluence/Jira config - and the job stops here, merging
+      # nothing. That is the safe mode to install and test in.
+      #
+      # IMPORTANT: Heroku's GitHub auto-deploy must stay ENABLED. Nothing in
+      # this workflow pushes to Heroku - it watches the build that Heroku's
+      # own integration starts on merge. If auto-deploy is turned off, no
+      # build ever appears, cf_cache_purge.py waits out BUILD_TIMEOUT, fails,
+      # and trips the UAT_DEPLOY_FAILED breaker, which stalls the whole queue.
+      - name: Require controlled Heroku deployment
+        id: controlled
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          # Reads a repository variable live. A variable that does not exist yet
+          # (HTTP 404) reads as empty; any other failure - typically a token
+          # without Variables read access - fails the step instead of silently
+          # treating the gate as open.
+          read_var() {
+            local out
+            if out=$(gh api "repos/${GITHUB_REPOSITORY}/actions/variables/$1" --jq '.value' 2>&1); then
+              printf '%s' "$out"; return 0
+            fi
+            if printf '%s' "$out" | grep -q 'HTTP 404'; then
+              return 0
+            fi
+            echo "::error::Could not read repository variable $1 - failing closed: $out" >&2
+            return 1
+          }
+
+          # Read live so turning the switch off also stops runs already queued.
+          CONTROLLED_DEPLOYMENTS_ENABLED=$(read_var CONTROLLED_DEPLOYMENTS_ENABLED) || exit 1
+          if [ "$CONTROLLED_DEPLOYMENTS_ENABLED" != "true" ]; then
+            echo "::error::Controlled deployments are disabled. Set CONTROLLED_DEPLOYMENTS_ENABLED=true once the workflow, script, labels and repository variables are installed and Heroku GitHub auto-deploy is confirmed ENABLED for this app."
+            exit 1
+          fi
+
+      # Every gate has passed. Record the release BEFORE merging, and clear it
+      # only once the deploy is verified healthy. If this run is cancelled or
+      # the runner dies from here on, the flag stays set and every later
+      # release stops at "Check UAT deploy health" until someone has checked
+      # what is actually deployed - nothing depends on a cleanup step running.
+      - name: Mark release in progress
+        id: in-progress
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          UAT_DEPLOY_FAILED_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh variable set UAT_DEPLOY_FAILED_REASON --body "Release of PR #${{ github.event.pull_request.number }} (${{ github.event.pull_request.head.sha }}) started but was never verified healthy. Check what is deployed on UAT before clearing."
+          gh variable set UAT_DEPLOY_FAILED_RUN_URL --body "$UAT_DEPLOY_FAILED_RUN_URL"
+          gh variable set UAT_DEPLOY_FAILED --body "true"
+
+      # Merges exactly the commit the release was requested for. The SHA pin
+      # only protects the head commit, so immediately before EVERY attempt
+      # (including retries) it also re-checks the PR's base and title, who last
+      # applied pci-approved, and the Jira ticket's status and PCI flag.
+      - name: Merge the approved commit
+        id: merge
+        uses: actions/github-script@v7
+        env:
+          # How long to keep retrying while GitHub says "not mergeable yet" -
+          # e.g. another required check still running. Holds the queue meanwhile.
+          MERGE_WAIT_SECONDS: ${{ vars.MERGE_WAIT_SECONDS || '300' }}
+          IS_PCI: ${{ needs.validate.outputs.is_pci }}
+          JIRA_TICKET: ${{ needs.validate.outputs.jira_ticket }}
+          JIRA_BASE_URL: https://jira.example.invalid
+        with:
+          github-token: ${{ secrets.GH_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const number = context.issue.number;
+            const requested = context.payload.pull_request;
+            const sha = requested.head.sha;
+            const deadline = Date.now() + Number(process.env.MERGE_WAIT_SECONDS) * 1000;
+            const sleep = ms => new Promise(r => setTimeout(r, ms));
+            const releaseSlug = String(process.env.RELEASE_TEAM).toLowerCase().replace(/\s+/g, '-');
+            // TESTING ONLY: "Open" is accepted, as in validation. Remove before go-live.
+            const READY = ['Ready For Production', 'Open'];
+
+            // Returns why Jira blocks the merge, or null. Fails closed.
+            async function jiraProblem() {
+              const ticket = process.env.JIRA_TICKET;
+              const auth = Buffer.from(`${process.env.JIRA_USER}:${process.env.JIRA_TOKEN}`).toString('base64');
+              // SANDBOX: Jira is simulated by the repo variable SIM_JIRA_<KEY>.
+              let issue;
+              try {
+                const { data } = await github.request('GET /repos/{owner}/{repo}/actions/variables/{name}',
+                  { owner, repo, name: `SIM_JIRA_${ticket.replace(/-/g, '_')}` });
+                const [simStatus, simPci] = data.value.split('|');
+                issue = { fields: { status: { name: simStatus }, customfield_10733: { value: simPci } } };
+              } catch (e) {
+                return `Jira returned HTTP ${e.status || 'error'} for ${ticket} (SANDBOX: SIM_JIRA variable)`;
+              }
+              const status = issue.fields?.status?.name || '';
+              const pci = issue.fields?.customfield_10733?.value || 'no';
+              if (!READY.includes(status)) return `Jira ${ticket} is '${status || 'unknown'}', not Ready For Production`;
+              if (process.env.IS_PCI !== 'true' && /^(yes|true|pci)$/i.test(pci)) {
+                return `Jira ${ticket} is now marked PCI, but this PR was validated as non-PCI - it needs re-validating and pci-approved`;
+              }
+              return null;
+            }
+
+            // Returns why the PCI approval is not valid, or null. Presence of the
+            // label is not enough: it could have been removed and re-added by
+            // someone outside release while this run waited. Fails closed.
+            async function approvalProblem() {
+              const events = await github.paginate(github.rest.issues.listEventsForTimeline, {
+                owner, repo, issue_number: number, per_page: 100
+              });
+              const applied = events.filter(e => e.event === 'labeled' && e.label?.name === 'pci-approved');
+              const actor = applied.length ? applied[applied.length - 1].actor?.login : null;
+              if (!actor) return 'there is no record of who applied pci-approved';
+              try {
+                const r = await github.request('GET /orgs/{org}/teams/{team_slug}/memberships/{username}',
+                  { org: owner, team_slug: releaseSlug, username: actor });
+                if (r.data.state === 'active') return null;
+              } catch (e) {
+                if (e.status !== 404) return `@${actor}'s release-team membership could not be verified (${e.message})`;
+              }
+              return `pci-approved was last applied by @${actor}, who is not an active member of the release team`;
+            }
+
+            // "merged=false" means definitely not merged: the next step clears
+            // the in-progress flag. Leaving it unset keeps the queue blocked.
+            const notMerged = message => {
+              core.setOutput('merged', 'false');
+              core.setFailed(message);
+            };
+            const merged = (mergeSha, headSha) => {
+              if (headSha !== sha) {
+                core.warning(`PR #${number} was merged at ${headSha.slice(0, 7)}, not the approved ${sha.slice(0, 7)} - merged outside the queue. Watching the deployment anyway, since that code is now on UAT.`);
+              }
+              core.setOutput('merged', 'true');
+              core.setOutput('merge_commit_sha', mergeSha);
+              core.info(`PR #${number} merged as ${mergeSha}.`);
+            };
+
+            while (true) {
+              // No merge request is outstanding at this point, so a failed read
+              // here still means "definitely not merged".
+              let pr;
+              try {
+                ({ data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number }));
+              } catch (e) {
+                return notMerged(`Could not re-read PR #${number} before merging: ${e.message}`);
+              }
+              if (pr.merged) return merged(pr.merge_commit_sha, pr.head.sha);
+
+              const changed = [];
+              if (pr.state !== 'open') changed.push('the PR was closed');
+              if (pr.base.ref !== requested.base.ref) changed.push(`the base branch changed to ${pr.base.ref}`);
+              if (pr.title !== requested.title) changed.push('the title changed');
+              if (pr.head.sha !== sha) changed.push('new commits were pushed');
+              if (process.env.IS_PCI === 'true' && !pr.labels.some(l => l.name === 'pci-approved')) changed.push('pci-approved was removed');
+              if (changed.length > 0) {
+                return notMerged(`Not merged - since the release was requested ${changed.join('; ')}.`);
+              }
+
+              if (process.env.IS_PCI === 'true') {
+                let problem;
+                try {
+                  problem = await approvalProblem();
+                } catch (e) {
+                  problem = `the PR timeline could not be read (${e.message})`;
+                }
+                if (problem) return notMerged(`Not merged - ${problem}.`);
+              }
+
+              const jira = await jiraProblem();
+              if (jira) return notMerged(`Not merged - ${jira}.`);
+
+              try {
+                const { data } = await github.rest.pulls.merge({
+                  owner, repo, pull_number: number, sha, merge_method: 'squash'
+                });
+                return merged(data.sha, sha);
+              } catch (error) {
+                // 405 = not mergeable yet (a required check still running, or
+                // a review missing). Retry while there is time.
+                if (error.status === 405 && Date.now() < deadline) {
+                  core.info(`Not mergeable yet (${error.message}); retrying in 15s.`);
+                  await sleep(15000);
+                  continue;
+                }
+
+                // Definite rejections: GitHub answered, and the answer was no.
+                if ([403, 404, 405, 409, 422].includes(error.status)) {
+                  return notMerged(`GitHub refused to merge PR #${number}: ${error.message}`);
+                }
+
+                // No definite answer (timeout, 5xx): the merge may still go
+                // through. Watch for it for a minute; if it never shows up,
+                // stay blocked so a human can reconcile.
+                for (let i = 0; i < 4; i++) {
+                  await sleep(15000);
+                  try {
+                    const { data: again } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+                    if (again.merged) return merged(again.merge_commit_sha, again.head.sha);
+                  } catch (e) {
+                    core.info(`Could not re-read the PR: ${e.message}`);
+                  }
+                }
+                core.setFailed(`Merge response was ambiguous (${error.message}) and PR #${number} has not shown as merged. UAT_DEPLOY_FAILED stays set until someone checks whether it merged.`);
+                return;
+              }
+            }
+
+      # Definitely not merged, so nothing is deploying: undo "in progress".
+      # Only the flag is cleared - the reason and run URL are only ever shown
+      # while the flag is true.
+      - name: Clear in-progress flag when nothing merged
+        if: always() && steps.merge.outputs.merged == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: gh variable set UAT_DEPLOY_FAILED --body "false"
+
+      # continue-on-error so the breaker and reporting below still run; the
+      # "Re-raise" step then turns the job red.
+      - name: Wait for Heroku build and dynos, purge Cloudflare
+        id: deploy
+        continue-on-error: true
+        env:
+          COMMIT_SHA: ${{ steps.merge.outputs.merge_commit_sha }}
+          # SANDBOX: how long the fake deploy takes - long enough to see the queue hold.
+          SIM_DEPLOY_SECONDS: ${{ vars.SIM_DEPLOY_SECONDS || '90' }}
+          # SANDBOX: add the label sim:deploy-fail to a PR to make its deploy fail.
+          SIM_FAIL: ${{ contains(github.event.pull_request.labels.*.name, 'sim:deploy-fail') }}
+        run: |
+          echo "SANDBOX: simulating Heroku build, dynos and Cloudflare purge for $COMMIT_SHA (${SIM_DEPLOY_SECONDS}s)"
+          sleep "$SIM_DEPLOY_SECONDS"
+          if [ "$SIM_FAIL" = "true" ]; then
+            echo "::error::SANDBOX: simulated deploy failure (sim:deploy-fail label)"
+            exit 1
+          fi
+          echo "SANDBOX: simulated deploy healthy, cache purged"
+
+      - name: Block further releases after a failed deploy
+        if: steps.deploy.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          UAT_DEPLOY_FAILED_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          UAT_DEPLOY_FAILED_REASON="UAT deploy of PR #${{ github.event.pull_request.number }} (${{ steps.merge.outputs.merge_commit_sha }}) did not come up healthy"
+          gh variable set UAT_DEPLOY_FAILED_REASON --body "$UAT_DEPLOY_FAILED_REASON"
+          gh variable set UAT_DEPLOY_FAILED_RUN_URL --body "$UAT_DEPLOY_FAILED_RUN_URL"
+          gh variable set UAT_DEPLOY_FAILED --body "true"
+          echo "::error::$UAT_DEPLOY_FAILED_REASON - further UAT releases are blocked until someone confirms the app is healthy and runs: gh variable set UAT_DEPLOY_FAILED --body false"
+
+      - name: Clear deploy-failed flag after a healthy deploy
+        if: steps.deploy.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: gh variable set UAT_DEPLOY_FAILED --body "false"
+
+      - name: Comment on Jira
+        if: always() && (steps.deploy.outcome == 'success' || steps.deploy.outcome == 'failure')
+        env:
+          JIRA_TICKET: ${{ needs.validate.outputs.jira_ticket }}
+          JIRA_BASE_URL: https://jira.example.invalid
+          OUTCOME: ${{ steps.deploy.outcome }}
+          COMMIT_SHA: ${{ steps.merge.outputs.merge_commit_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          if [ "$OUTCOME" = "success" ]; then
+            BODY="UAT deployment verified - dynos up, Cloudflare cache purged. Commit: $COMMIT_SHA"
+          else
+            BODY="UAT deployment or cache purge failed. Run: $RUN_URL"
+          fi
+          # REST v3 needs the body in Atlassian Document Format, not a plain string.
+          jq -n --arg body "$BODY" '{body: {type: "doc", version: 1, content: [{type: "paragraph", content: [{type: "text", text: $body}]}]}}' > jira-comment.json
+          # SANDBOX: no Jira - show what would have been posted.
+          echo "::notice::SANDBOX Jira comment on ${JIRA_TICKET}: $BODY"
+
+      - name: Re-raise deploy failure
+        if: always() && steps.deploy.outcome == 'failure'
+        run: |
+          echo "::error::UAT deploy verification failed for ${{ steps.merge.outputs.merge_commit_sha }}"
+          exit 1
+
+      # One place that tells the PR why its release stopped, whichever step
+      # it was. Also runs on cancellation.
+      - name: Report on the PR
+        if: failure() || cancelled()
+        uses: actions/github-script@v7
+        env:
+          STEPS: ${{ toJSON(steps) }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const steps = JSON.parse(process.env.STEPS);
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const merged = steps.merge?.outputs?.merged === 'true';
+            // Recorded in progress and not since cleared by a definite "not merged".
+            const recorded = steps['in-progress']?.outcome === 'success' && steps.merge?.outputs?.merged !== 'false';
+            const retry = 'Once that is resolved, request review from the release team again (for PCI, remove and re-add `pci-approved`).';
+            const clear = '\n\n```\ngh variable set UAT_DEPLOY_FAILED --body false\n```';
+
+            const REASONS = {
+              authorize: 'the release was requested by someone outside the release team',
+              current: 'the PR changed after the release was requested',
+              bypass: 'the bypass-label check failed',
+              'app-lock': 'the app is frozen in the Confluence App Lock table',
+              'app-lock-repo': '`APP_LOCKED` is set on the repository',
+              'deploy-health': 'the previous UAT release has not been verified healthy (`UAT_DEPLOY_FAILED` is set)',
+              controlled: 'controlled deployments are switched off (`CONTROLLED_DEPLOYMENTS_ENABLED`)',
+              'in-progress': 'the release could not be recorded before merging',
+              merge: 'GitHub did not merge the PR, or the PR, its Jira ticket or its PCI approval changed just before merging',
+            };
+            const failedStep = Object.entries(steps).find(([, s]) => s.conclusion === 'failure');
+
+            let body;
+            if (steps.deploy?.outcome === 'failure') {
+              body = `## UAT deployment did not come up healthy\n\nThis PR merged, but the UAT app did not reach a verified-healthy state (build, dynos or cache purge).\n\n**Further UAT releases are blocked.** Once the app is confirmed healthy, clear the block with:${clear}`;
+            } else if (merged) {
+              body = `## Release interrupted after merging\n\nThis PR merged, but the deployment was never verified.\n\n**Further UAT releases are blocked.** Check that UAT is healthy and running this PR's code, then clear the block with:${clear}`;
+            } else if (recorded) {
+              body = `## Release interrupted\n\nThe run stopped after recording the release in progress, so **further UAT releases are blocked.** Check whether this PR merged and, if it did, that UAT is healthy and running its code. Then clear the block with:${clear}\n\nIf it did not merge, request review from the release team again afterwards (for PCI, remove and re-add \`pci-approved\`).`;
+            } else if (failedStep) {
+              body = `## Release stopped - nothing was merged\n\nReason: ${REASONS[failedStep[0]] || failedStep[0]}. See the run for details.\n\n${retry}`;
+            } else {
+              body = `## Release cancelled - nothing was merged\n\n${retry}`;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `${body}\n\n[View the run](${run})`
+            });
