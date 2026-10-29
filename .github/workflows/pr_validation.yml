@@ -2,6 +2,9 @@
 # SANDBOX COPY - generated from workflows/phase2.yaml. Do not edit by hand.
 # Jira, Confluence, Heroku and Cloudflare are SIMULATED (see sandbox/README.md).
 # NEVER install this file in a real repo: it reports fake deploys as healthy.
+#
+# PATCHED BY HAND after generation (not yet in phase2.yaml): the release job
+# gets GH_REPO and pull-requests: write. See the "SANDBOX PATCH" comments.
 # =====================================================================
 name: PR Validation
 
@@ -363,7 +366,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: read
+      # SANDBOX PATCH: was `read`. Commenting on a PR through the issues API
+      # needs pull-requests: write as well as issues: write (403 otherwise).
+      pull-requests: write
       issues: write
     if: |
       (github.event.action == 'review_requested' && github.event.requested_team.name == 'release' && needs.validate.outputs.is_pci != 'true') ||
@@ -377,6 +382,9 @@ jobs:
       # lowercased into a team slug for the membership API.
       PIPELINE_NAME: "sandbox-app"
       RELEASE_TEAM: Release
+      # SANDBOX PATCH: this job has no checkout, so `gh variable set` cannot
+      # work out the repo from git ("not a git repository") without this.
+      GH_REPO: ${{ github.repository }}
     steps:
       # Anyone with write access can request a team review or add a label, so
       # the person who did it must be on the release team. Fails closed.
